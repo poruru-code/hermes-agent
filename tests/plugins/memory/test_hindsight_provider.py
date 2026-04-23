@@ -19,6 +19,7 @@ from plugins.memory.hindsight import (
     REFLECT_SCHEMA,
     RETAIN_SCHEMA,
     _load_config,
+    _normalize_prefetch_metadata_fields,
     _normalize_retain_tags,
 )
 
@@ -72,6 +73,12 @@ def _make_mock_client():
     client.aretain_batch = AsyncMock()
     client.aclose = AsyncMock()
     return client
+
+
+def _run_prefetch(provider, query="test query"):
+    provider.queue_prefetch(query)
+    if provider._prefetch_thread:
+        provider._prefetch_thread.join(timeout=5.0)
 
 
 class _FakeSessionDB:
@@ -147,6 +154,18 @@ def test_normalize_retain_tags_accepts_json_array_string():
     assert _normalize_retain_tags(value) == ["agent:fakeassistantname", "source_system:hermes-agent"]
 
 
+def test_normalize_prefetch_metadata_fields_accepts_csv_and_allowlist():
+    assert _normalize_prefetch_metadata_fields("chat_id, thread_id, user_name, chat_id") == [
+        "chat_id",
+        "thread_id",
+    ]
+
+
+def test_normalize_prefetch_metadata_fields_accepts_json_array_string():
+    value = json.dumps(["source", "platform", "chat_name"])
+    assert _normalize_prefetch_metadata_fields(value) == ["source", "platform"]
+
+
 # ---------------------------------------------------------------------------
 # Schema tests
 # ---------------------------------------------------------------------------
@@ -203,6 +222,8 @@ class TestConfig:
             retain_source="hermes",
             retain_user_prefix="User (fakeusername)",
             retain_assistant_prefix="Assistant (fakeassistantname)",
+            recall_prefetch_metadata_fields=["chat_id", "thread_id"],
+            recall_prefetch_metadata_strict=True,
             recall_tags=["recall-tag"],
             recall_tags_match="all",
             auto_retain=False,
@@ -221,6 +242,8 @@ class TestConfig:
         assert p._retain_source == "hermes"
         assert p._retain_user_prefix == "User (fakeusername)"
         assert p._retain_assistant_prefix == "Assistant (fakeassistantname)"
+        assert p._recall_prefetch_metadata_fields == ["chat_id", "thread_id"]
+        assert p._recall_prefetch_metadata_strict is True
         assert p._recall_tags == ["recall-tag"]
         assert p._recall_tags_match == "all"
         assert p._auto_retain is False
@@ -249,6 +272,10 @@ class TestConfig:
         assert cfg["apiKey"] == "env-key"
         assert cfg["banks"]["hermes"]["bankId"] == "env-bank"
         assert cfg["banks"]["hermes"]["budget"] == "high"
+
+    def test_default_prefetch_metadata_config(self, provider):
+        assert provider._recall_prefetch_metadata_fields == []
+        assert provider._recall_prefetch_metadata_strict is False
 
 
 # ---------------------------------------------------------------------------
@@ -365,6 +392,26 @@ class TestToolHandlers:
         ))
         assert "error" in result
 
+    def test_recall_tool_ignores_prefetch_metadata_scope(self, provider_with_config):
+        p = provider_with_config(
+            recall_prefetch_metadata_fields=["chat_id"],
+            recall_prefetch_metadata_strict=True,
+        )
+        p._chat_id = "current-chat"
+        p._client.arecall = AsyncMock(
+            return_value=SimpleNamespace(
+                results=[
+                    SimpleNamespace(
+                        text="Foreign memory",
+                        metadata={"chat_id": "other-chat"},
+                    )
+                ]
+            )
+        )
+
+        result = json.loads(p.handle_tool_call("hindsight_recall", {"query": "test"}))
+        assert result["result"] == "1. Foreign memory"
+
 
 # ---------------------------------------------------------------------------
 # Prefetch tests
@@ -427,15 +474,184 @@ class TestPrefetch:
             recall_max_tokens=1024,
             recall_types=["world"],
         )
-        p.queue_prefetch("test query")
-        if p._prefetch_thread:
-            p._prefetch_thread.join(timeout=5.0)
+        _run_prefetch(p)
 
         call_kwargs = p._client.arecall.call_args.kwargs
         assert call_kwargs["max_tokens"] == 1024
         assert call_kwargs["tags"] == ["t1"]
         assert call_kwargs["tags_match"] == "all"
         assert call_kwargs["types"] == ["world"]
+
+    def test_queue_prefetch_default_config_leaves_results_unfiltered(self, provider):
+        provider._client.arecall = AsyncMock(
+            return_value=SimpleNamespace(
+                results=[
+                    SimpleNamespace(
+                        text="Foreign memory",
+                        metadata={"chat_id": "other-chat", "thread_id": "other-thread"},
+                    ),
+                    SimpleNamespace(text="Unscoped memory"),
+                ]
+            )
+        )
+
+        _run_prefetch(provider)
+
+        assert provider._recall_prefetch_metadata_fields == []
+        assert provider._prefetch_result.splitlines() == ["- Foreign memory", "- Unscoped memory"]
+
+    def test_queue_prefetch_filters_results_by_metadata(self, provider_with_config):
+        p = provider_with_config(recall_prefetch_metadata_fields=["chat_id", "thread_id"])
+        p._chat_id = "current-chat"
+        p._thread_id = "current-thread"
+        p._client.arecall = AsyncMock(
+            return_value=SimpleNamespace(
+                results=[
+                    SimpleNamespace(
+                        text="Keep me",
+                        metadata={"chat_id": "current-chat", "thread_id": "current-thread"},
+                    ),
+                    SimpleNamespace(
+                        text="Drop me",
+                        metadata={"chat_id": "other-chat", "thread_id": "other-thread"},
+                    ),
+                ]
+            )
+        )
+
+        _run_prefetch(p)
+
+        assert p._prefetch_result == "- Keep me"
+
+    def test_queue_prefetch_keeps_unscoped_results_when_metadata_scope_non_strict(self, provider_with_config):
+        p = provider_with_config(recall_prefetch_metadata_fields=["chat_id", "thread_id"])
+        p._chat_id = "current-chat"
+        p._thread_id = "current-thread"
+        p._client.arecall = AsyncMock(
+            return_value=SimpleNamespace(
+                results=[
+                    SimpleNamespace(
+                        text="Scoped memory",
+                        metadata={"chat_id": "current-chat", "thread_id": "current-thread"},
+                    ),
+                    SimpleNamespace(text="Unscoped memory"),
+                    SimpleNamespace(
+                        text="Foreign memory",
+                        metadata={"chat_id": "other-chat", "thread_id": "other-thread"},
+                    ),
+                ]
+            )
+        )
+
+        _run_prefetch(p)
+
+        assert p._prefetch_result.splitlines() == ["- Scoped memory", "- Unscoped memory"]
+
+    def test_queue_prefetch_drops_unscoped_results_when_metadata_scope_strict(self, provider_with_config):
+        p = provider_with_config(
+            recall_prefetch_metadata_fields=["chat_id", "thread_id"],
+            recall_prefetch_metadata_strict=True,
+        )
+        p._chat_id = "current-chat"
+        p._thread_id = "current-thread"
+        p._client.arecall = AsyncMock(
+            return_value=SimpleNamespace(
+                results=[
+                    SimpleNamespace(
+                        text="Scoped memory",
+                        metadata={"chat_id": "current-chat", "thread_id": "current-thread"},
+                    ),
+                    SimpleNamespace(text="Unscoped memory"),
+                ]
+            )
+        )
+
+        _run_prefetch(p)
+
+        assert p._prefetch_result == "- Scoped memory"
+
+    def test_queue_prefetch_filtered_empty_stays_empty_without_retry(self, provider_with_config):
+        p = provider_with_config(
+            recall_prefetch_metadata_fields=["chat_id", "thread_id"],
+            recall_prefetch_metadata_strict=True,
+        )
+        p._chat_id = "current-chat"
+        p._thread_id = "current-thread"
+        p._client.arecall = AsyncMock(
+            return_value=SimpleNamespace(
+                results=[
+                    SimpleNamespace(
+                        text="Foreign memory",
+                        metadata={"chat_id": "other-chat", "thread_id": "other-thread"},
+                    ),
+                    SimpleNamespace(text="Unscoped memory"),
+                ]
+            )
+        )
+
+        _run_prefetch(p)
+
+        assert p._client.arecall.await_count == 1
+        assert p._prefetch_result == ""
+        assert p.prefetch("test query") == ""
+
+    def test_queue_prefetch_drops_partial_metadata_results(self, provider_with_config):
+        p = provider_with_config(recall_prefetch_metadata_fields=["chat_id", "thread_id"])
+        p._chat_id = "current-chat"
+        p._thread_id = "current-thread"
+        p._client.arecall = AsyncMock(
+            return_value=SimpleNamespace(
+                results=[
+                    SimpleNamespace(
+                        text="Scoped memory",
+                        metadata={"chat_id": "current-chat", "thread_id": "current-thread"},
+                    ),
+                    SimpleNamespace(
+                        text="Partial memory",
+                        metadata={"chat_id": "current-chat"},
+                    ),
+                ]
+            )
+        )
+
+        _run_prefetch(p)
+
+        assert p._prefetch_result == "- Scoped memory"
+
+    def test_queue_prefetch_metadata_scope_is_ignored_for_reflect_method(self, provider_with_config):
+        p = provider_with_config(
+            recall_prefetch_method="reflect",
+            recall_prefetch_metadata_fields=["chat_id"],
+            recall_prefetch_metadata_strict=True,
+        )
+        p._chat_id = "current-chat"
+        p._client.areflect = AsyncMock(return_value=SimpleNamespace(text="Synthesized answer"))
+
+        _run_prefetch(p)
+
+        assert p._prefetch_result == "Synthesized answer"
+        p._client.arecall.assert_not_called()
+
+    def test_queue_prefetch_metadata_scope_is_noop_when_active_scope_empty(self, provider_with_config):
+        p = provider_with_config(
+            recall_prefetch_metadata_fields=["thread_id"],
+            recall_prefetch_metadata_strict=True,
+        )
+        p._client.arecall = AsyncMock(
+            return_value=SimpleNamespace(
+                results=[
+                    SimpleNamespace(
+                        text="Foreign memory",
+                        metadata={"thread_id": "other-thread"},
+                    ),
+                    SimpleNamespace(text="Unscoped memory"),
+                ]
+            )
+        )
+
+        _run_prefetch(p)
+
+        assert p._prefetch_result.splitlines() == ["- Foreign memory", "- Unscoped memory"]
 
 
 # ---------------------------------------------------------------------------
@@ -570,6 +786,7 @@ class TestConfigSchema:
             "mode", "api_url", "api_key", "llm_provider", "llm_api_key",
             "llm_model", "bank_id", "bank_mission", "bank_retain_mission",
             "recall_budget", "memory_mode", "recall_prefetch_method",
+            "recall_prefetch_metadata_fields", "recall_prefetch_metadata_strict",
             "retain_tags", "retain_source",
             "retain_user_prefix", "retain_assistant_prefix",
             "recall_tags", "recall_tags_match",
