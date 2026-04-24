@@ -41,15 +41,7 @@ _DEFAULT_API_URL = "https://api.hindsight.vectorize.io"
 _DEFAULT_LOCAL_URL = "http://localhost:8888"
 _MIN_CLIENT_VERSION = "0.4.22"
 _VALID_BUDGETS = {"low", "mid", "high"}
-_PREFETCH_METADATA_FIELDS = (
-    "source",
-    "platform",
-    "chat_id",
-    "chat_type",
-    "thread_id",
-    "agent_identity",
-)
-_TRUTHY_CONFIG_VALUES = {"1", "true", "yes", "on"}
+_VALID_TAG_MATCH_MODES = {"any", "all", "any_strict", "all_strict"}
 _PROVIDER_DEFAULT_MODELS = {
     "openai": "gpt-4o-mini",
     "anthropic": "claude-haiku-4-5",
@@ -200,7 +192,7 @@ def _load_config() -> dict:
     }
 
 
-def _normalize_retain_tags(value: Any) -> List[str]:
+def _normalize_tags(value: Any) -> List[str]:
     """Normalize tag config/tool values to a deduplicated list of strings."""
     if value is None:
         return []
@@ -237,41 +229,10 @@ def _normalize_retain_tags(value: Any) -> List[str]:
     return normalized
 
 
-def _normalize_prefetch_metadata_fields(value: Any) -> List[str]:
-    """Normalize prefetch metadata field config to an allowed deduplicated list."""
-    if value is None:
-        return []
-
-    raw_items: list[Any]
-    if isinstance(value, list):
-        raw_items = value
-    elif isinstance(value, str):
-        text = value.strip()
-        if not text:
-            return []
-        if text.startswith("["):
-            try:
-                parsed = json.loads(text)
-            except Exception:
-                parsed = None
-            if isinstance(parsed, list):
-                raw_items = parsed
-            else:
-                raw_items = text.split(",")
-        else:
-            raw_items = text.split(",")
-    else:
-        raw_items = [value]
-
-    normalized = []
-    seen = set()
-    for item in raw_items:
-        field = str(item).strip()
-        if not field or field in seen or field not in _PREFETCH_METADATA_FIELDS:
-            continue
-        seen.add(field)
-        normalized.append(field)
-    return normalized
+def _normalize_tags_match(value: Any) -> str:
+    """Normalize tag match mode to a supported choice."""
+    candidate = str(value or "any").strip().lower() or "any"
+    return candidate if candidate in _VALID_TAG_MATCH_MODES else "any"
 
 
 def _utc_timestamp() -> str:
@@ -320,6 +281,8 @@ class HindsightMemoryProvider(MemoryProvider):
         self._tags: list[str] | None = None
         self._recall_tags: list[str] | None = None
         self._recall_tags_match = "any"
+        self._recall_prefetch_tags: list[str] | None = None
+        self._recall_prefetch_tags_match = "any"
 
         # Retain controls
         self._auto_retain = True
@@ -335,8 +298,6 @@ class HindsightMemoryProvider(MemoryProvider):
         self._recall_types: list[str] | None = None
         self._recall_prompt_preamble = ""
         self._recall_max_input_chars = 800
-        self._recall_prefetch_metadata_fields: List[str] = []
-        self._recall_prefetch_metadata_strict = False
 
         # Bank
         self._bank_mission = ""
@@ -539,8 +500,8 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "recall_budget", "description": "Recall thoroughness", "default": "mid", "choices": ["low", "mid", "high"]},
             {"key": "memory_mode", "description": "Memory integration mode", "default": "hybrid", "choices": ["hybrid", "context", "tools"]},
             {"key": "recall_prefetch_method", "description": "Auto-recall method", "default": "recall", "choices": ["recall", "reflect"]},
-            {"key": "recall_prefetch_metadata_fields", "description": "Automatically require these session-stable retained metadata fields to match during auto-prefetch recall (comma-separated: source, platform, chat_id, chat_type, thread_id, agent_identity)", "default": ""},
-            {"key": "recall_prefetch_metadata_strict", "description": "If true, auto-prefetch keeps only results whose selected metadata fields are all present and equal; if false, fully unscoped results are still allowed, but partial matches are dropped", "default": False},
+            {"key": "recall_prefetch_tags", "description": "Auto-prefetch recall only: explicit tags to use instead of generic recall_tags when searching memories (comma-separated)", "default": ""},
+            {"key": "recall_prefetch_tags_match", "description": "Auto-prefetch recall only: tag matching mode for recall_prefetch_tags", "default": "any", "choices": ["any", "all", "any_strict", "all_strict"]},
             {"key": "retain_tags", "description": "Default tags applied to retained memories (comma-separated)", "default": ""},
             {"key": "retain_source", "description": "Metadata source value attached to retained memories", "default": ""},
             {"key": "retain_user_prefix", "description": "Label used before user turns in retained transcripts", "default": "User"},
@@ -652,13 +613,17 @@ class HindsightMemoryProvider(MemoryProvider):
         self._bank_retain_mission = self._config.get("bank_retain_mission") or None
 
         # Tags
-        self._retain_tags = _normalize_retain_tags(
+        self._retain_tags = _normalize_tags(
             self._config.get("retain_tags")
             or os.environ.get("HINDSIGHT_RETAIN_TAGS", "")
         )
         self._tags = self._retain_tags or None
-        self._recall_tags = self._config.get("recall_tags") or None
-        self._recall_tags_match = self._config.get("recall_tags_match", "any")
+        self._recall_tags = _normalize_tags(self._config.get("recall_tags")) or None
+        self._recall_tags_match = _normalize_tags_match(self._config.get("recall_tags_match", "any"))
+        self._recall_prefetch_tags = _normalize_tags(self._config.get("recall_prefetch_tags")) or None
+        self._recall_prefetch_tags_match = _normalize_tags_match(
+            self._config.get("recall_prefetch_tags_match", "any")
+        )
         self._retain_source = str(
             self._config.get("retain_source") or os.environ.get("HINDSIGHT_RETAIN_SOURCE", "")
         ).strip()
@@ -680,13 +645,6 @@ class HindsightMemoryProvider(MemoryProvider):
         self._recall_types = self._config.get("recall_types") or None
         self._recall_prompt_preamble = self._config.get("recall_prompt_preamble", "")
         self._recall_max_input_chars = int(self._config.get("recall_max_input_chars", 800))
-        self._recall_prefetch_metadata_fields = _normalize_prefetch_metadata_fields(
-            self._config.get("recall_prefetch_metadata_fields")
-        )
-        strict_value = self._config.get("recall_prefetch_metadata_strict", False)
-        if isinstance(strict_value, str):
-            strict_value = strict_value.strip().lower() in _TRUTHY_CONFIG_VALUES
-        self._recall_prefetch_metadata_strict = bool(strict_value)
         self._retain_async = self._config.get("retain_async", True)
 
         _client_version = "unknown"
@@ -698,10 +656,10 @@ class HindsightMemoryProvider(MemoryProvider):
         logger.info("Hindsight initialized: mode=%s, api_url=%s, bank=%s, budget=%s, memory_mode=%s, prefetch_method=%s, client=%s",
                      self._mode, self._api_url, self._bank_id, self._budget, self._memory_mode, self._prefetch_method, _client_version)
         logger.debug("Hindsight config: auto_retain=%s, auto_recall=%s, retain_every_n=%d, "
-                     "retain_async=%s, retain_context=%s, recall_max_tokens=%d, recall_max_input_chars=%d, tags=%s, recall_tags=%s, prefetch_metadata_fields=%s, prefetch_metadata_strict=%s",
+                     "retain_async=%s, retain_context=%s, recall_max_tokens=%d, recall_max_input_chars=%d, tags=%s, recall_tags=%s, prefetch_tags=%s, prefetch_tags_match=%s",
                      self._auto_retain, self._auto_recall, self._retain_every_n_turns,
                      self._retain_async, self._retain_context, self._recall_max_tokens, self._recall_max_input_chars,
-                     self._tags, self._recall_tags, self._recall_prefetch_metadata_fields, self._recall_prefetch_metadata_strict)
+                     self._tags, self._recall_tags, self._recall_prefetch_tags, self._recall_prefetch_tags_match)
 
         # For local mode, start the embedded daemon in the background so it
         # doesn't block the chat. Redirect stdout/stderr to a log file to
@@ -818,56 +776,6 @@ class HindsightMemoryProvider(MemoryProvider):
         )
         return f"{header}\n\n{result}"
 
-    def _build_prefetch_metadata_scope(self) -> Dict[str, str]:
-        current_values = {
-            "source": self._retain_source,
-            "platform": self._platform,
-            "chat_id": self._chat_id,
-            "chat_type": self._chat_type,
-            "thread_id": self._thread_id,
-            "agent_identity": self._agent_identity,
-        }
-        scope: Dict[str, str] = {}
-        for field in self._recall_prefetch_metadata_fields:
-            value = current_values.get(field, "")
-            if value:
-                scope[field] = value
-        return scope
-
-    def _filter_prefetch_results_by_metadata(
-        self,
-        results: List[Any],
-        *,
-        active_scope: Dict[str, str] | None = None,
-    ) -> List[Any]:
-        if not results or not self._recall_prefetch_metadata_fields:
-            return results
-
-        scope = active_scope if active_scope is not None else self._build_prefetch_metadata_scope()
-        if not scope:
-            return results
-
-        filtered: List[Any] = []
-        scope_keys = tuple(scope.keys())
-        for result in results:
-            metadata = getattr(result, "metadata", None)
-            if not isinstance(metadata, dict):
-                metadata = {}
-
-            present_keys = [
-                key for key in scope_keys
-                if metadata.get(key) not in (None, "")
-            ]
-            if not present_keys:
-                if not self._recall_prefetch_metadata_strict:
-                    filtered.append(result)
-                continue
-            if len(present_keys) != len(scope_keys):
-                continue
-            if all(str(metadata[key]) == scope[key] for key in scope_keys):
-                filtered.append(result)
-        return filtered
-
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         if self._memory_mode == "tools":
             logger.debug("Prefetch: skipped (tools-only mode)")
@@ -891,32 +799,23 @@ class HindsightMemoryProvider(MemoryProvider):
                         "bank_id": self._bank_id, "query": query,
                         "budget": self._budget, "max_tokens": self._recall_max_tokens,
                     }
-                    if self._recall_tags:
-                        recall_kwargs["tags"] = self._recall_tags
-                        recall_kwargs["tags_match"] = self._recall_tags_match
+                    prefetch_tags = self._recall_prefetch_tags or self._recall_tags
+                    prefetch_tags_match = (
+                        self._recall_prefetch_tags_match
+                        if self._recall_prefetch_tags
+                        else self._recall_tags_match
+                    )
+                    if prefetch_tags:
+                        recall_kwargs["tags"] = prefetch_tags
+                        recall_kwargs["tags_match"] = prefetch_tags_match
                     if self._recall_types:
                         recall_kwargs["types"] = self._recall_types
                     logger.debug("Prefetch: calling recall (bank=%s, query_len=%d, budget=%s)",
                                  self._bank_id, len(query), self._budget)
                     resp = _run_sync(client.arecall(**recall_kwargs))
                     results = list(resp.results or [])
-                    num_results = len(results)
-                    logger.debug("Prefetch: recall returned %d results", num_results)
-                    active_scope = self._build_prefetch_metadata_scope()
-                    filtered_results = self._filter_prefetch_results_by_metadata(
-                        results,
-                        active_scope=active_scope,
-                    )
-                    if self._recall_prefetch_metadata_fields:
-                        if active_scope:
-                            logger.debug(
-                                "Prefetch: metadata filter kept %d/%d results",
-                                len(filtered_results),
-                                num_results,
-                            )
-                        else:
-                            logger.debug("Prefetch: metadata filter disabled (empty active scope)")
-                    text = "\n".join(f"- {r.text}" for r in filtered_results if r.text) if filtered_results else ""
+                    logger.debug("Prefetch: recall returned %d results", len(results))
+                    text = "\n".join(f"- {r.text}" for r in results if r.text) if results else ""
                 with self._prefetch_lock:
                     self._prefetch_result = text
             except Exception as e:
@@ -989,8 +888,8 @@ class HindsightMemoryProvider(MemoryProvider):
             kwargs["document_id"] = document_id
         if retain_async is not None:
             kwargs["retain_async"] = retain_async
-        merged_tags = _normalize_retain_tags(self._retain_tags)
-        for tag in _normalize_retain_tags(tags):
+        merged_tags = _normalize_tags(self._retain_tags)
+        for tag in _normalize_tags(tags):
             if tag not in merged_tags:
                 merged_tags.append(tag)
         if merged_tags:

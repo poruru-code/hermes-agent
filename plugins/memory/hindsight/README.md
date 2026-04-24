@@ -69,16 +69,20 @@ Config file: `~/.hermes/hindsight/config.json`
 |-----|---------|-------------|
 | `recall_budget` | `mid` | Recall thoroughness: `low` / `mid` / `high` |
 | `recall_prefetch_method` | `recall` | Auto-recall method: `recall` (raw facts) or `reflect` (LLM synthesis) |
-| `recall_prefetch_metadata_fields` | — | Auto-prefetch recall only: local metadata scope filter fields (comma-separated; allowed: `source`, `platform`, `chat_id`, `chat_type`, `thread_id`, `agent_identity`) |
-| `recall_prefetch_metadata_strict` | `false` | Auto-prefetch recall only: when `true`, keep only fully scoped exact matches; when `false`, fully unscoped results are still allowed, but partial matches are dropped |
 | `recall_max_tokens` | `4096` | Maximum tokens for recall results |
 | `recall_max_input_chars` | `800` | Maximum input query length for auto-recall |
 | `recall_prompt_preamble` | — | Custom preamble for recalled memories in context |
 | `recall_tags` | — | Tags to filter when searching memories |
 | `recall_tags_match` | `any` | Tag matching mode: `any` / `all` / `any_strict` / `all_strict` |
+| `recall_prefetch_tags` | — | Auto-prefetch recall only: explicit tags to use instead of generic `recall_tags` |
+| `recall_prefetch_tags_match` | `any` | Auto-prefetch recall only: tag matching mode for `recall_prefetch_tags` |
 | `auto_recall` | `true` | Automatically recall memories before each turn |
 
-`recall_prefetch_metadata_fields` and `recall_prefetch_metadata_strict` apply only to automatic prefetch recall. They do not affect the manual `hindsight_recall` tool and are ignored when `recall_prefetch_method=reflect`. Filtering is local and best-effort; if the selected fields resolve to an empty active scope for the current session, it becomes a no-op for that prefetch run.
+`recall_prefetch_tags` and `recall_prefetch_tags_match` apply only to automatic prefetch recall. When unset, auto-prefetch falls back to the generic `recall_tags` and `recall_tags_match` settings. They do not affect the manual `hindsight_recall` tool and are ignored when `recall_prefetch_method=reflect`.
+
+If you want hard tag scoping, use a `_strict` match mode. Hindsight's non-strict `any` and `all` modes can still include untagged memories.
+
+This design changes only the read path. It does not add implicit session-derived tags, metadata-to-tag bridging, or any write-path changes to auto-retain or manual `hindsight_retain`. As a result, `recall_prefetch_tags` only matches memories that already carry those tags; untagged memories are not automatically backfilled or inferred from metadata.
 
 ### Retain
 
