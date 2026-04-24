@@ -478,7 +478,9 @@ class HindsightMemoryProvider(MemoryProvider):
         existing = {}
         if config_path.exists():
             try:
-                existing = json.loads(config_path.read_text())
+                parsed = json.loads(config_path.read_text())
+                if isinstance(parsed, dict):
+                    existing = parsed
             except Exception:
                 pass
         existing.update(values)
@@ -589,13 +591,12 @@ class HindsightMemoryProvider(MemoryProvider):
             val = input(f"  LLM model [{default_model}]: ").strip()
             provider_config["llm_model"] = val or default_model
 
-            sys.stdout.write("  LLM API key: ")
-            sys.stdout.flush()
-            llm_key = getpass.getpass(prompt="") if sys.stdin.isatty() else sys.stdin.readline().strip()
             effective_config = dict(provider_config)
             config_path = Path(hermes_home) / "hindsight" / "config.json"
             try:
-                effective_config = json.loads(config_path.read_text(encoding="utf-8"))
+                saved_config = json.loads(config_path.read_text(encoding="utf-8"))
+                if isinstance(saved_config, dict):
+                    effective_config.update(saved_config)
             except Exception:
                 pass
             effective_config.update(provider_config)
@@ -605,6 +606,10 @@ class HindsightMemoryProvider(MemoryProvider):
                     "HINDSIGHT_API_LLM_API_KEY",
                     "",
                 )
+            prompt = "  LLM API key (blank to keep existing): " if existing_llm_key else "  LLM API key: "
+            sys.stdout.write(prompt)
+            sys.stdout.flush()
+            llm_key = getpass.getpass(prompt="") if sys.stdin.isatty() else sys.stdin.readline().strip()
             # Always write explicitly (including empty) so the provider sees ""
             # rather than a missing variable.  The daemon reads from .env at
             # startup and fails when HINDSIGHT_LLM_API_KEY is unset.
